@@ -494,57 +494,6 @@ Mniejsza wartość parametru `SUS_TRAVEL` w telemetrii oznacza rozprężenie (un
 
 Systemy asystujące (głównie ABS na tylnej osi oraz TC) aktywują się najczęściej wtedy, gdy lewe tylne zawieszenie ulega mocnemu rozprężeniu (spadek mediany do poziomu 30 mm). Ma to uzasadnienie w prawach dynamiki. Podczas ekstremalnego dohamowania przed zakrętem 1, który dodatkowo gwałtownie opada w dół, dochodzi do potężnego transferu masy na przednią oś pojazdu. Tylna oś zostaje wtedy 'odciążona' (podrywa się do góry). Lekkie, pozbawione docisku pionowego koło natychmiast traci przyczepność wzdłużną i wpada w poślizg, co wymusza natychmiastową i agresywną interwencję systemów pokładowych."
 
-```{r}
-# Wybieramy 10 najważniejszych predyktorów numerycznych z rankingu MI
-top_10_zmienne <- ranking_cech %>%
-  filter(Predyktor != "INTERWENCJA" & !Predyktor %in% c("GEAR")) %>% # odrzucamy zmienne dyskretne
-  head(10) %>%
-  pull(Predyktor)
-
-# Obliczamy macierz korelacji liniowej Pearsona
-macierz_kor <- cor(dane_modelowanie %>% select(all_of(top_10_zmienne)), use = "complete.obs")
-
-# Przekształcamy macierz do formatu długiego (tidy), aby ggplot mógł ją łatwo narysować
-dane_korelacji <- as.data.frame(macierz_kor) %>%
-  mutate(Zmienna1 = rownames(.)) %>%
-  pivot_longer(-Zmienna1, names_to = "Zmienna2", values_to = "Wspolczynnik")
-
-# Rysowanie zaawansowanej mapy ciepła korelacji
-ggplot(dane_korelacji, aes(x = Zmienna1, y = Zmienna2, fill = Wspolczynnik)) +
-  geom_tile(color = "white", size = 0.5) +
-  # Paleta rozbieżna: silna korelacja dodatnia na czerwono, ujemna na niebiesko
-  scale_fill_gradient2(low = "#377EB8", high = "#E41A1C", mid = "white", 
-                       midpoint = 0, limit = c(-1, 1), space = "Lab", 
-                       name = "Korelacja") +
-  theme_minimal() + 
-  # Obrócenie napisów na osi X, aby się nie nakładały
-  theme(
-    axis.text.x = element_text(angle = 45, vjust = 1, size = 7, hjust = 1),
-    axis.text.y = element_text(size = 7),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    plot.title = element_text(face = "bold", size = 9, hjust = 0),
-    plot.subtitle = element_text(size = 7, color = "gray30", hjust = 0)
-  ) +
-  coord_fixed() + 
-  labs(
-    title = "Mapa korelacji dla kluczowych predyktorów telemetrycznych",
-    subtitle = "Analiza współliniowości czujników o najwyższej sile informacji wzajemnej (MI)",
-    x = "",
-    y = ""
-  ) +
-  # Nałożenie wartości liczbowych na kafelki dla maksymalnej czytelności
-  geom_text(aes(label = round(Wspolczynnik, 2)), color = "black", size = 2)
-```
-
-- `WHEEL_SPEED` vs `SPEED_KMH` - prędkości obrotowe wszystkich czterech kół poruszają się w idealnej harmonii z prędkością samochodu (`SPEED_KMH`). To logiczne – auto rzadko jedzie w głębokim, ciągłym uślizgu wszystkich osi naraz.
-
-- `BRAKE_TEMP` - wyraźne bloki wysokiej korelacji dodatniej (w przedziale **0.84 – 0.95**) pomiędzy temperaturami tarcz hamulcowych. Czujniki temperatury na tej samej osi (np. lewy przód `LF` vs prawy przód `RF`) rozgrzewają się i chłodzą niemal identycznie, ponieważ balans hamulców rozkłada siłę symetrycznie na lewą i prawą stronę pojazdu.
-
-- `THROTTLE` vs `BRAKE` - na pełnej mapie korelacji zauważalna jest wyraźna ujemna korelacja pomiędzy pozycją pedału gazu (`THROTTLE`) a hamulca (`BRAKE`). Odzwierciedla to zachowanie kierowcy wyścigowego. Te dwa systemy operują w trybie niemal komplementarnym – kiedy kierowca gwałtownie hamuje przed zakrętem, całkowicie odpuszcza gaz i odwrotnie.
-
-- Zmienna `G_LON` (przeciążenie wzdłużne) wykazuje silną korelację ujemną z parametrem `BRAKE` oraz silną korelację dodatnią z `THROTTLE`. Wciśnięcie hamulca generuje siłę opóźniającą (ujemne wektory siły G), co powoduje gwałtowny spadek wartości `G_LON`. Przyspieszanie generuje wartości dodatnie. Z kolei kąt skrętu kierownicy (`STEERANGLE`) jest silnie powiązany z przeciążeniem bocznym (`G_LAT`), co stanowi matematyczne odzwierciedlenie siły odśrodkowej wypychającej auto w zakręcie.
-
 ## 5. Strategia próbkowania i balansowania danych (tidymodels + themis)
 
 Przechodzimy do bezpośredniego przygotowania danych pod budowę 5 modeli. Definiujemy podział na zbiór treningowy i testowy oraz budujemy `recipe`, w którym zaimplementujemy standaryzację oraz balansowanie klas.
@@ -856,15 +805,22 @@ print(vip_plot)
 
 W celu przełamania bariery „czarnej skrzynki” (*black box*) charakterystycznej dla Lasów Losowych, zastosowano metodę globalnej interpretowalności **VIP (Variable Importance Plot)** opartą na kryterium czystości Gini (*Gini Importance*). Wykres obrazuje stopień, w jakim poszczególne czujniki telemetryczne przyczyniły się do podjęcia prawidłowych decyzji klasyfikacyjnych przez 100 drzew decyzyjnych algorytmu.
 
-Wygenerowany wykres VIP ujawnia fascynującą strukturę zależności, w której trzy parametry drastycznie dominują nad resztą stawki:
+Analiza rozkładu wag cech ujawnia głęboką zależność przyczynowo-skutkową, która w pełni pokrywa się z prawami mechaniki ruchu pojazdu wyścigowego:
 
-1.  **Dominacja prędkości kół przednich (`WHEEL_SPEED_LF` i `WHEEL_SPEED_RF`):** Te dwa czujniki zajęły bezapelacyjnie dwa pierwsze miejsca w hierarchii ważności. Wynika to bezpośrednio z faktu, że system ABS w samochodzie McLaren 720S GT3 reaguje na prędkość obrotową kół osi kierowanej. Ponieważ zakręty na torze Brands Hatch wymagają intensywnego hamowania połączonego ze skrętem (*trail braking*), odciążone koło wewnętrzne błyskawicznie traci prędkość kątową w stosunku do prędkości liniowej auta. Las Losowy zidentyfikował te dwa sensory jako kluczowe indykatory wejściowe.
+1.  **Absolutna dominacja skoku lewego tylnego zawieszenia (`SUS_TRAVEL_LR`):** Czujnik ten osiągnął najwyższą wartość istotności (ponad 6500 punktów Gini), drastycznie dystansując pozostałe predyktory. Z punktu widzenia fizyki toru Brands Hatch jest to wniosek fundamentalny. W fazie wejścia w głębokie zakręty (w szczególności opadający i ślepy *Paddock Hill Bend* - Zakręt 1) połączonej z techniką *trail-brakingu*, dochodzi do gwałtownego transferu masy na przednią oś i prawą (zewnętrzną) stronę pojazdu. Koło tylne lewe (`LR`) zostaje ekstremalnie odciążone, co sensor rejestruje jako rozprężenie amortyzatora. Pozbawiona docisku pionowego opona momentalnie traci kontakt normatywny z podłożem i wpada w poślizg (zarówno pod wpływem hamowania, jak i próby aplikacji momentu obrotowego na wyjściu), co generuje natychmiastową reakcję systemów ABS/TC. Model bezbłędnie zidentyfikował ten czujnik jako kluczowy zwiastun utraty stabilności.
 
-2.  **Wysoka pozycja pedału hamulca (`BRAKE`):** Trzecie miejsce czujnika `BRAKE` potwierdza logiczną zależność przyczynowo-skutkową: to bezpośrednia siła nacisku generowana przez stopę kierowcy inicjuje proces destabilizacji wzdłużnej opon, doprowadzając do aktywacji modulatora ciśnienia ABS.
+2.  **Sygnały osi sterującej i obciążenia silnika (`WHEEL_SPEED_LF` oraz `THROTTLE`):**
+    Drugą pozycję zajął czujnik prędkości obrotowej lewego przedniego koła (`WHEEL_SPEED_LF`), a tuż za nim uplasował się stopień otwarcia przepustnicy (`THROTTLE`). Wskazuje to na doskonałe odwzorowanie przez model dwóch odrębnych scenariuszy granicznych:
 
-3.  **Wpływ prędkości kół tylnych (`WHEEL_SPEED_LR`):** Wysoka pozycja tego parametru odpowiada z kolei za wykrywanie momentu zerwania przyczepności podczas przyspieszania (aktywacja Kontroli Trakcji - TC). Model monitoruje obroty osi napędowej w celu natychmiastowego zdławienia momentu obrotowego silnika.
+    - **Scenariusz hamowania (ABS):** Blokowanie koła przedniego wewnętrznego (`LF`) w prawych łukach.
 
-4.  **Rola przeciążeń bocznych i kąta skrętu (`G_LAT`, `STEERANGLE`):** Te predyktory zajmują stabilne pozycje w środkowej części rankingu. Potwierdzają one nieliniową naturę elipsy Kamma – ryzyko aktywacji systemów asystujących drastycznie rośnie, gdy do hamowania lub przyspieszania dochodzi wektor siły bocznej wynikający ze skręcania pojazdu.
+    - **Scenariusz przyspieszania (TC):** Zerwanie przyczepności osi napędowej w momencie agresywnego otwierania przepustnicy na wyjściu z zakrętów, gdzie silnik McLarena GT3 generuje potężny moment obrotowy.
+
+3.  **Relatywna symetria prędkości kół tylnych i docisku aerodynamicznego:**
+    Dalsze pozycje zajmują czujniki prędkości kół tylnych (`WHEEL_SPEED_LR` i `RR`) oraz skok prawego tylnego zawieszenia (`SUS_TRAVEL_RR`). Świadczy to o tym, że model precyzyjnie monitoruje uślizg poprzeczny (nadsterowność) oraz globalny docisk aerodynamiczny pojazdu (`SPEED_KMH` znajduje się w środku stawki, co wiąże się bezpośrednio z generowaniem siły docisku *downforce* dociskającej nadwozie przy wysokich prędkościach).
+
+4.  **Niska pozycja czujników pierwotnych (`STEERANGLE`, `BRAKE`, `BRAKE_TEMP_LF`):**
+    Czujniki bezpośrednich akcji kierowcy (pozycja kierownicy i nacisk na hamulec) znalazły się w dolnej części rankingu istotności. Jest to logicznie uzasadnione metodologicznie: sam fakt wciśnięcia hamulca lub skręcenia kierownicy nie oznacza jeszcze poślizgu. Dopiero **wtórna, fizyczna odpowiedź pojazdu** na te akcje (czyli odciążenie zawieszenia `SUS_TRAVEL` i delty prędkości kół `WHEEL_SPEED`) niesie za sobą deterministyczną informację o przekroczeniu limitu przyczepności.
 
 Podsumowując, globalna analiza wyjaśnialności dowodzi, że model Lasu Losowego nie opierał swoich decyzji na przypadkowych anomaliach lub szumie tła (np. statycznych ciśnieniach opon, które słusznie znalazły się na samym dole), lecz stworzył logiczną, w pełni odzwierciedlającą prawa fizyki strukturę wnioskowania na podstawie kluczowych parametrów kinematycznych i operacyjnych pojazdu.
 
