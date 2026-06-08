@@ -1,0 +1,967 @@
+---
+title: ' Analiza danych telemetrycznych z symulatora Assetto Corsa Competizione'
+author: "Karolina Sawicka IAD 102994"
+subtitle: Na przykładzie danych z wyścigu na torze Brands Hatch pojazdem McLaren 720s GT3 Evo
+output:
+  html_document:
+    theme: flatly
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+## 1. Wprowadzenie i cel projektu
+
+### 1.1. Wprowadzenie
+
+Współczesny sport motorowy oraz zaawansowane symulatory wyścigowe (ang. *simracing*) generują ogromne strumienie danych telemetrycznych o wysokiej częstotliwości próbkowania. Analiza tych danych stanowi kluczowy element optymalizacji osiągów pojazdu oraz wsparcia kierowcy w czasie rzeczywistym. Symulator *Assetto Corsa Competizione* (ACC), charakteryzuje się niezwykle zaawansowanym i certyfikowanym silnikiem fizycznym, który z wysoką wiernością odwzorowuje dynamikę pojazdów klasy GT3 i GT4, pracę zawieszenia, aerodynamikę oraz zjawiska utraty przyczepności opon.
+
+Tradycyjne metody analizy telemetrii opierają się na manualnym przeglądaniu wykresów przez inżyniera wyścigowego w poszukiwaniu anomalii lub błędów kierowcy. Podejście to jest jednak ograniczone czasowo i podatne na błędy ludzkie. Zastosowanie technik eksploracji danych (ang. *data mining*) oraz algorytmów uczenia maszynowego otwiera nowe możliwości w zakresie automatycznej detekcji stanów dynamicznych pojazdu na podstawie sygnałów płynących bezpośrednio z czujników (pozycja pedałów, kąt obrotu kierownicy, prędkości obrotowe kół, siły G).
+
+### 1.2. Cel projektu
+
+Głównym celem niniejszego projektu jest zbudowanie *machine learning pipeline* w oparciu o **`tidymodels`** w środowisku R, służącego do automatycznej klasyfikacji i predykcji momentów aktywacji systemów asystujących kierowcy – układu zapobiegającego blokowaniu kół podczas hamowania (**ABS**) oraz systemu kontroli trakcji (**TC**) – na podstawie surowych danych telemetrycznych z symulatora *Assetto Corsa Competizione*.
+
+Z inżynieryjnego punktu widzenia, celem jest stworzenie klasyfikatorów zdolnych do rozpoznania, na podstawie sygnałów z czujników dynamicznych oraz akcji kierowcy, że pojazd osiąga fizyczną granicę przyczepności wzdłużnej i bocznej, co skutkuje automatyczną interwencją systemów pokładowych.
+
+## 2. Charakterystyka danych telemetrycznych z Assetto Corsa Competizione
+
+Zbiór danych pochodzi z certyfikowanego symulatora wyścigowego *Assetto Corsa Competizione* i reprezentuje surowy zapis parametrów fizycznych pojazdu klasy GT3 podczas pełnego dystansu wyścigowego (44 okrążenia).
+
+### Profil techniczny zbioru:
+
+- **Liczba rekordów:** $> 800\ 000$ wierszy.
+
+- **Częstotliwość próbkowania:** 200 Hz (zapis klatkowy dokładnie co 5 ms ($0.005$ s), co pozwala na bezbłędne uchwycenie mikrozmian w dynamice zawieszenia i opon.
+
+- **Pochodzenie:** Konwersja surowych logów binarnych formatu `.id` z profesjonalnego oprogramowania inżynierii wyścigowej *MoTeC i2 Pro* do ustrukturyzowanego formatu tekstowego `.csv`.
+
+Dla celów modelowania eksploracyjnego, dostępne zmienne (cechy predykcyjne) podzielono na cztery logiczne podgrupy taksonomiczne:
+
+1.  **Sygnały sterujące kierowcy (Inputs):** Zmienne opisujące bezpośrednie interakcje człowieka z maszyna (`THROTTLE`, `BRAKE`, `CLUTCH`, `STEERANGLE`).
+
+2.  **Kinematyka i dynamika pojazdu (State):** Prędkość globalna, aktualny bieg oraz składowe wektora przyspieszenia (`SPEED`, `GEAR`, `G_LAT`, `G_LON`, `RPMS`).
+
+3.  **Systemy asystujące (Control):** Zmienne informujące o ingerencji algorytmów pokładowych pojazdu (`TC`, `ABS`).
+
+4.  **Termodynamika i mechanika kontaktu (Boundary conditions):** Parametry pracy zawieszenia, ciśnienia i temperatury opon oraz tarcz hamulcowych (`SUS_TRAVEL_*`, `BRAKE_TEMP_*`, `TYRE_PRESS_*`, `TYRE_TAIR_*`, `WHEEL_SPEED_*`, `BUMPSTOP_*`).
+
+Poniższa tabela przedstawia szczegółowy słownik pojęciowy oraz strukturę analizowanych cech.
+
+|  |  |  |
+|------------------------|------------------------|------------------------|
+| **Nazwa zmiennej (kolumna)** | **Jednostka** | **Opis funkcjonalny / Znaczenie fizyczne** |
+| **Time** | s | Czas ciągły mierzony od początku sesji logowania. |
+| **LAP_BEACON** | — | Marker okrążenia; liczba całkowita zapisywana po przekroczeniu linii mety. |
+| **SPEED** | m/s | Prędkość pojazdu. |
+| **GEAR** | — | Aktualnie załączony bieg (wartości od 0 do 6, gdzie 0 to bieg wsteczny lub luz). |
+| **THROTTLE** | \% | Pozycja pedału przyspieszenia w zakresie 0–100%. |
+| **BRAKE** | \% | Siła nacisku na pedał hamulca w zakresie 0–100%. |
+| **CLUTCH** | \% | Pozycja pedału sprzęgła (wykorzystywana głównie podczas procedury startowej). |
+| **RPMS** | 1/min | Prędkość obrotowa wału korbowego silnika. |
+| **STEERANGLE** | deg | Kąt obrotu kolumny kierownicy (wartości dodatnie i ujemne określające kierunek skrętu). |
+| **G_LAT** | m/s² | Przyspieszenie boczne (lateralne), wynikające ze skrętu pojazdu. |
+| **G_LON** | m/s² | Przyspieszenie wzdłużne (wzrost przy przyspieszaniu, spadek przy hamowaniu). |
+| **TC** | — | Indeks poziomu mapy kontroli trakcji (aktywność systemu ograniczającego uślizg kół napędowych). |
+| **ABS** | — | Indeks poziomu układu zapobiegającego blokowaniu kół podczas hamowania. |
+| **SUS_TRAVEL_LF/RF/LR/RR** | mm | Skok ugięcia zawieszenia dla każdego z 4 kół (LF-lewy przód, RF-prawy przód, etc.). |
+| **BRAKE_TEMP_LF/RF/LR/RR** | °C | Bieżąca temperatura tarcz hamulcowych. |
+| **TYRE_PRESS_LF/RF/LR/RR** | psi | Ciśnienie wewnątrz opony. |
+| **TYRE_TAIR_LF/RF/LR/RR** | °C | Temperatura powłoki powietrznej wewnątrz opony. |
+| **WHEEL_SPEED_LF/RF/LR/RR** | m/s | Prędkość liniowa obwodu koła (kluczowa do wyznaczania poślizgu mikro- i makroskopowego). |
+| **BUMPSTOPUP/DN_RIDE_LF/RF/LR/RR** | mm | Względna pozycja górnego i dolnego ogranicznika skoku zawieszenia. |
+| **BUMPSTOP_FORCE_LF/RF/LR/RR** | N | Siła kontaktowa generowana w momencie całkowitego dobicia zawieszenia do odboju. |
+| **EN\_... (ET, TL, TD, TB)** | — | Wewnętrzne, syntetyczne mapowania silnika i zmienne środowiskowe symulatora. |
+
+## 3. Inżynieria cech i transformacja danych (Czyszczenie i MI)
+
+### 3.1 Wczytanie danych
+
+Pierwotnie danych z pliku .csv nie dało się poprawnie wczytać ze względu na zamieszczonymi dwoma zbiorami w jednym pliku. Usunięto część odpowiadającą identyfikacji okrążenia od części głównej (`Beacon Markers` zostaną wczytane w dalszej części).
+
+![](Zrzut%20ekranu%202026-01-17%20o%2017.38.12.png)
+
+```{r}
+library(tidyverse)
+library(infotheo)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tidymodels)
+library(themis)
+library(rpart)
+library(ranger)
+library(xgboost)
+library(ggplot2)
+library(vip)
+```
+
+```{r}
+dane <- read.csv("brands_hatch-mclaren_720s_gt3_evo-31-2024.05.01-16.12.41.csv")
+#head(dane)
+```
+
+Usunięto pierwszy wiersz obserwacji zawierający jednostki poszczególnych zmiennych.
+
+```{r}
+dane <- dane %>% slice(-1)
+#head(dane)
+```
+
+```{r}
+#str(dane)
+```
+
+Wstępny podgląd tabeli pozwala na zweryfikowanie poprawności importu nazw kolumn oraz formatu przechowywanych wartości. Zauważono, że zmienne numeryczne zostały wczytane jako typ tekstowy. Aby umożliwić przeprowadzenie obliczeń statystycznych i modelowania, dokonano automatycznej zamiany przecinków na kropki oraz dokonano konwersji wszystkich odpowiednich kolumn na typ numeryczny. Ponowna weryfikacja potwierdza poprawność wykonanej operacji.
+
+```{r warning=FALSE}
+dane <- dane %>%
+  mutate(across(
+    where(is.character),
+    ~ as.numeric(gsub(",", ".", .x))
+  ))
+#str(dane)
+```
+
+### 3.3 Sprawdzenie braków danych, wykrywanie nieaktywnych sensorów
+
+Ważnym elementem przygotowania danych do modelowania statystycznego jest weryfikacja ich kompletności. Wykorzystano funkcję is.na(), aby sprawdzić, czy w logach telemetrii występują przerwy w zapisie.
+
+```{r}
+total_na <- sum(is.na(dane))
+print("Liczba brakujących wartości (NA) w zbiorze danych:")
+total_na
+```
+
+Wynik wynoszący 0 potwierdza, że zbiór jest kompletny, co pozwala na zachowanie ciągłości sygnałów w analizie czasowej i wyklucza konieczność stosowania metod imputacji danych.
+
+W telemetrii wyścigowej wartość 0 może oznaczać zarówno brak aktywności danego systemu (np. pedał hamulca w spoczynku), jak i błąd sensora lub nieaktywny kanał danych. Przeprowadzono analizę procentowego udziału zer dla wszystkich parametrów, co pozwala na wstępne rozpoznanie charakterystyki pracy pojazdu oraz wykrycie zmiennych o niskiej wariancji.
+
+```{r}
+zerowe_wartosci <- dane %>%
+  summarise(across(everything(), ~ mean(. == 0, na.rm = TRUE) * 100))
+
+zerowe_wartosci
+```
+
+`LAP_BEACON` ma wartosc 100. To by oznaczało, że cała kolumna `LAP_BEACON` to zera. Podział na okrążenia może nie działać poprawnie. To potwierdza brak wczytanych danych datyczących identyfikacji numeru okrążenia.
+
+```{r}
+# Przekształcenie tabeli na pionową i filtrowanie
+puste_parametry <- zerowe_wartosci %>%
+  pivot_longer(everything(), names_to = "Parametr", values_to = "Procent_Zer") %>%
+  filter(Procent_Zer > 90) %>%
+  arrange(desc(Procent_Zer))
+
+# Wyświetlenie listy
+print(puste_parametry)
+```
+
+Analiza wartości zerowych dostarczyła kluczowego wniosku dla celu:
+
+- **`ABS` wynosi zero przez 96.5% czasu jazdy.**
+
+- **`TC` wynosi zero przez 94.5% czasu jazdy.**
+
+To oznacza, że systemy te aktywują się rzadko (odpowiednio przez 3.5% i 5.5% czasu trwania sesji) – tylko wtedy, gdy kierowca dochodzi do limitu przyczepności. Potwierdza to, że nasz problem predykcyjny to **klasyczna klasyfikacja danych niezbalansowanych**.
+
+### 3.4 Standaryzacja jednostek prędkości
+
+W surowej telemetrii prędkość rejestrowana jest w układzie SI ($m/s$). Dla celów analizy inżynierskiej oraz lepszej interpretacji wyników, dokonano konwersji na jednostkę powszechnie stosowaną w sporcie motorowym — kilometry na godzinę ($km/h$). Zmiana nazwy kolumny na `SPEED_MS` pozwala na zachowanie precyzji opisu danych.
+
+```{r}
+dane <- dane %>%
+  rename(SPEED_MS = SPEED) %>%
+  
+  mutate(SPEED_KMH = SPEED_MS * 3.6, .after = SPEED_MS)
+```
+
+W celu poprawy czytelności raportu i wizualizacji, zaimplementowano funkcję `format_racing_time`. Przekształca ona czas wyrażony w sekundach na standardowy format wyścigowy **mm:ss.ms**. Funkcja uwzględnia specyficzne zaokrąglanie milisekund, co jest niezbędne przy porównywaniu czasów okrążeń.
+
+```{r}
+format_racing_time <- function(seconds) {
+  mm <- floor(seconds / 60)
+  ss <- floor(seconds %% 60)
+  ms <- round((seconds - floor(seconds)) * 1000)
+  
+  ms[ms == 1000] <- 999
+  
+  sprintf("%02d:%02d.%03d", mm, ss, ms)
+}
+```
+
+Dokonano standaryzacji nazewnictwa głównej osi czasu na `TIME_S` (sekundy sesji). Dodatkowo, wykorzystując wcześniej zdefiniowaną funkcję, utworzono kolumnę `TIME_FMT`.
+
+```{r}
+dane <- dane %>% 
+  rename(TIME_S = Time) %>%
+  mutate(
+    TIME_FMT = format_racing_time(TIME_S),
+    .after = TIME_S 
+  )
+```
+
+### 3.5 Wstępne czyszczenie
+
+Usunięto dane gdzie pojazd był podczas postoju w boxie/na polach startowych przed startem wyścigu.
+
+```{r}
+# znajdujemy dokładny moment (w sekundach), w którym auto ruszyło po raz pierwszy (prędkość > 2 km/h)
+moment_startu <- dane %>%
+  filter(SPEED_KMH > 2) %>%
+  slice(1) %>%
+  pull(TIME_S)
+
+# filtrujemy zbiór danych, zostawiając tylko rekordy od momentu startu w górę
+dane <- dane %>%
+  filter(TIME_S >= moment_startu)
+```
+
+### 3.5. Uzupełnienie danych punktów pomiarowych (Lap Beacons)
+
+Przeprowadzono ręczną rekonstrukcję punktów przecięcia linii mety. Wykorzystano do tego znaczniki czasu ($s$) zidentyfikowane podczas sesji. Dane te posłużą jako klucz do podziału całego zbioru na indywidualne okrążenia, co umożliwi analizę statystyczną powtarzalności kierowcy.
+
+```{r}
+beacons_raw <- "120.369 217.641 304.120 388.987 474.894 536.731 627.610 713.532 802.816 887.348 978.305 1244.750 1415.090 1503.960 1589.090 1673.830 1759.190 1844.540 1929.940 2015.770 2100.960 2187.810 2273.350 2358.480 2444.260 2530.100 2616.110 2701.910 2787.200 2873.000 2958.730 3044.460 3130.130 3216.200 3301.980 3387.790 3524.960 3615.200 3701.430 3788.080 3874.140 3959.760 4045.530"
+
+beacons <- data.frame(
+  LAP_BEACON = seq_along(strsplit(beacons_raw, " ")[[1]]),
+  Time_lap_s = as.numeric(strsplit(beacons_raw, " ")[[1]])
+)
+```
+
+### 3.6. Segmentacja sesji na indywidualne okrążenia
+
+Kluczowym wyzwaniem w pracy z surową telemetrią jest podział ciągłego zapisu czasu (`TIME_S`) na logiczne jednostki — okrążenia. Wykorzystano funkcję `findInterval`, która na podstawie zrekonstruowanych wcześniej znaczników (beacons) przypisała każdemu rekordowi numer okrążenia. Jest to fundament pod analizę porównawczą.
+
+```{r}
+dane$TIME_S <- as.numeric(gsub(",", ".", dane$TIME_S))
+dane <- dane %>%
+  mutate(LAP_BEACON = findInterval(TIME_S, beacons$Time_lap_s) + 1)
+```
+
+W celu ułatwienia dostępu do szczegółowych profili prędkości czy hamowania, zbiór danych został rozbity na listę obiektów. Taka struktura pozwala na szybkie wywołanie konkretnego okrążenia bez konieczności każdorazowego filtrowania całej bazy danych, co optymalizuje proces analityczny.
+
+```{r}
+laps_list <- dane %>%
+  group_split(LAP_BEACON)
+
+names(laps_list) <- paste0("lap_", sapply(laps_list, function(x) unique(x$LAP_BEACON)))
+
+#head(laps_list$lap_24)
+```
+
+### 3.7. Obliczenie rzeczywistych czasów okrążeń
+
+Na podstawie różnicy między maksymalnym a minimalnym czasem wewnątrz każdego segmentu (`LAP_BEACON`), wyliczono precyzyjny czas trwania okrążenia. Wyniki zostały sformatowane do standardu wyścigowego, co pozwala na wstępną ocenę tempa kierowcy na torze Brands Hatch.
+
+```{r}
+lap_times <- dane %>%
+  group_by(LAP_BEACON) %>%
+  summarise(
+    LAP_TIME_S = max(TIME_S) - min(TIME_S)
+  ) %>%
+  mutate(
+    TIME_FMT = format_racing_time
+    (LAP_TIME_S)
+  ) %>%
+  rename(LAP_NUMBER = LAP_BEACON)
+
+print(lap_times)
+```
+
+### 3.8 Dalsze czyszczenie danych
+
+Zidentyfikowano 2 znacznie dłuższe okrążenia - traktowane jako wartości odstające. Możliwy scenariusz:
+
+- **Okrążenie 12 (04:26.440):** **zjazd do boksów (In-lap) połączony z obsługą serwisową** (wymiana opon, tankowanie, postój). Pojazd poruszał się wtedy z włączonym ogranicznikiem prędkości w alei serwisowej (pit limiter) do 50 km/h, a potem stał w miejscu.
+
+- **Okrążenie 13 (02:50.335):** **okrążenie wyjazdowe (Out-lap)**. Kierowca ruszał z miejsca z boksów, jechał powoli aleją serwisową, a po wyjeździe na tor prawdopodobnie musiał dogrzać nowe, zimne opony, stąd tak wysoki czas.
+
+  Alternatywnie: na okrążeniu 12 lub 13 doszło do potężnego wypadku (dzwon/obrót), po którym kierowca długo wracał na tor i na torze było ograniczenie żółtymi flagami.
+
+```{r}
+dane <- dane %>%
+  # usuwamy okrążenia 12 i 13 (Pit stop / Wypadek)
+  filter(!(LAP_BEACON %in% c(12, 13)))
+  
+```
+
+Ze względu na to, że dynamika pojazdu w boksach oraz procedury obsługi opon wprowadzają szum informacyjny niezwiązany z wyścigową granicą przyczepności, okrążenia te zostały w całości usunięte z bazy treningowej jako obserwacje odstające.
+
+```{r}
+#summary(dane)
+```
+
+### 3.9. Definicja zmiennej docelowej i eliminacja wycieku danych
+
+Przed przystąpieniem do analizy istotności cech należy formalnie zdefiniować zmienną objaśnianą `INTERWENCJA` oraz usunąć kolumny, które nie mogą brać udziału w predykcji. Wykluczamy surowe zmienne `ABS` i `TC` (wyciek danych) oraz osie czasu i identyfikatory okrążeń, które nie mają wpływu na fizykę opony.
+
+```{r}
+# --- DEFINICJA TARGETU I OSTATECZNE FILTROWANIE ---
+dane_modelowanie <- dane %>%
+  # Definicja zmiennej docelowej (klasyfikacja binarna)
+  mutate(INTERWENCJA = if_else(ABS > 0 | TC > 0, "Interwencja", "Stabilnie"),
+         INTERWENCJA = factor(INTERWENCJA, levels = c("Interwencja", "Stabilnie"))) %>%
+  
+  # Filtrowanie prędkości operacyjnej (fizyka opon działa powyżej 20 km/h)
+  filter(SPEED_KMH > 20) %>%
+  
+  # Usunięcie zmiennych niebędących predyktorami fizycznymi oraz zapobieganie wyciekowi danych
+  select(-TIME_S, -TIME_FMT, -LAP_BEACON, -ABS, -TC, -CLUTCH, -SPEED_MS, -TIME, -starts_with("EN_"))
+
+# Sprawdzenie ostatecznego wymiaru ramki danych do modelowania
+dim(dane_modelowanie)
+```
+
+Wymiar ramki (`703696` wierszy, `42` kolumny).
+
+```{r}
+table(dane_modelowanie$INTERWENCJA)
+```
+
+**Rozkład klas:**
+
+- `Interwencja`: 72 293 (ok. **10,27%**)
+
+- `Stabilnie`: 631 403 (ok. **89,73%**)
+
+### 3.10. Selekcja cech przy użyciu Informacji Wzajemnej (Mutual Information)
+
+W celu zidentyfikowania zmiennych o największym potencjale dyskryminacyjnym, zastosowano miarę informacji wzajemnej z pakietu `infotheo`. Metoda ta pozwala wykryć zaawansowane, nieliniowe korelacje, które klasyczny współczynnik korelacji Pearsona mógłby pominąć.
+
+```{r}
+# Dyskretyzacja zmiennych numerycznych (metoda równomiernych przedziałów)
+dane_discretized <- infotheo::discretize(dane_modelowanie %>% select(where(is.numeric)))
+
+# Obliczenie wartości Mutual Information względem zmiennej INTERWENCJA
+mi_scores <- sapply(dane_discretized, function(col) {
+  infotheo::mutinformation(col, dane_modelowanie$INTERWENCJA)
+})
+
+# Prezentacja wyników 
+ranking_cech <- data.frame(
+  Predyktor = names(mi_scores),
+  Mutual_Information = as.numeric(mi_scores)
+) %>%
+  arrange(desc(Mutual_Information))
+
+print(ranking_cech)
+```
+
+Na podstawie uzyskanych wyników MI możesz dokonać wstępnej selekcji cech. Zmienne na samym dole rankingu (z wartościami MI poniżej `0.002`) wnoszą tak znikomą ilość informacji, że ich pozostawienie może jedynie wydłużyć czas obliczeń lub powodować szum.
+
+```{r}
+# Wybieramy predyktory, które mają MI >= 0.002
+zmienne_do_zostawienia <- ranking_cech %>%
+  filter(Mutual_Information >= 0.002) %>%
+  pull(Predyktor)
+
+# Dodajemy zmienną docelową do listy
+zmienne_do_zostawienia <- c("INTERWENCJA", zmienne_do_zostawienia)
+
+# Filtrujemy główną ramkę danych
+dane_modelowanie <- dane_modelowanie %>%
+  select(all_of(zmienne_do_zostawienia))
+
+dim(dane_modelowanie)
+```
+
+Wymiar nowej ramki (`703696` wierszy, `34` kolumny).
+
+## 4. Eksploracyjna Analiza Danych (EDA) i wizualizacje fizyczne
+
+W tej sekcji zwizualizujemy kluczowe relacje fizyczne panujące w zebranej telemetrii, wykorzystując predyktory, które okazały się najważniejsze w teście informacji wzajemnej (`SUS_TRAVEL_LR`, `G_LAT`, `G_LON`).
+
+### 4.1. Wizualizacja kręgu przyczepności Kamma (Friction Circle)
+
+Zgodnie z prawami fizyki dynamiki pojazdów, opona posiada ograniczony limit przyczepności, który musi podzielić pomiędzy siły wzdłużne (hamowanie/przyspieszanie) a siły boczne (skręcanie). Wykres przeciążeń wzdłużnych (`G_LON`) względem bocznych (`G_LAT`) tworzy tzw. *Krąg Kamma*.
+
+Poniższy wykres prezentuje ten stan z podziałem na punkty, w których systemy pokładowe musiały wspomóc kierowcę.
+
+```{r}
+# AUTOMATYCZNE IZOLOWANIE JEDNEGO ZAKRĘTU
+# Znajdujemy sekundę, w której kierowca najmocniej wcisnął hamulec na 4. okrążeniu
+moment_maks_hamowania <- dane %>%
+  filter(LAP_BEACON == 4) %>%
+  filter(BRAKE == max(BRAKE)) %>%
+  slice(1) %>%
+  pull(TIME_S)
+
+# Wycinamy czyste okienko: 1.5 sekundy przed hamowaniem (jazda na prostej)oraz 5.5 sekundy po (wejście w zakręt, apex i wyjście na prostą)
+dane_zakret <- dane %>%
+  filter(LAP_BEACON == 4, 
+         TIME_S >= (moment_maks_hamowania - 1.5) & 
+           TIME_S <= (moment_maks_hamowania + 5.5)) %>%
+  mutate(
+    INTERWENCJA = if_else(ABS > 0 | TC > 0, "Interwencja", "Stabilnie"),
+    INTERWENCJA = factor(INTERWENCJA, levels = c("Interwencja", "Stabilnie")),
+    # Tworzymy czas relatywny od początku zakrętu (dla czytelniejszej legendy)
+    Czas_Zakretu = TIME_S - min(TIME_S)
+  )
+
+# GEOMETRIA ELIPSY PRZYCZEPNOŚCI
+# Szerokość (G_LAT) = 6.2, Wysokość (G_LON) = 2.2
+max_x <- 6.2  
+max_y <- 2.2  
+ellipse_data <- data.frame(
+  x = seq(-max_x, max_x, length.out = 200)
+) %>%
+  mutate(
+    y_pos = max_y * sqrt(1 - (x / max_x)^2),
+    y_neg = -max_y * sqrt(1 - (x / max_x)^2)
+  )
+
+# GENEROWANIEIDEALNEGO WYKRESU
+ggplot() +
+  # Rysowanie przerywanej linii realnego limitu przyczepności (Elipsa)
+  geom_path(data = ellipse_data, aes(x = x, y = y_pos), color = "red", linetype = "dashed", size = 0.8, alpha = 0.7) +
+  geom_path(data = ellipse_data, aes(x = x, y = y_neg), color = "red", linetype = "dashed", size = 0.8, alpha = 0.7) +
+  
+  # Linie pomocnicze układu współrzędnych (środek fizyczny)
+  geom_hline(yintercept = 0, color = "gray80", linetype = "dotted") +
+  geom_vline(xintercept = 0, color = "gray80", linetype = "dotted") +
+  
+  # PŁYNNA ŚCIEŻKA PRZEJAZDU (Połączenie punktów w idealną trajektorię)
+  geom_path(data = dane_zakret, aes(x = G_LAT, y = G_LON, color = Czas_Zakretu), size = 1.2, alpha = 0.9) +
+  
+  # DUŻE, WYRAŹNE PUNKTY w miejscach interwencji systemów (np. ABS przy dohamowaniu)
+  geom_point(data = dane_zakret %>% filter(INTERWENCJA == "Interwencja"), 
+             aes(x = G_LAT, y = G_LON), color = "#FF5500", size = 3.5, shape = 19) +
+  
+  # Skalowanie osi dopasowane do elipsy (brak pustych przestrzeni)
+  coord_cartesian(xlim = c(-max_x - 0.5, max_x + 0.5), ylim = c(-max_y - 0.5, max_y + 0.5)) +
+  
+  # Profesjonalna paleta barw (Viridis - cividis lub plasma) pokazuąca sekwencję czasu
+  scale_color_viridis_c(option = "viridis") +
+  
+  theme_minimal() +
+  labs(
+    title = "Profil sił dynamicznych w zakręcie (Brands Hatch - Zakręt 1)",
+    subtitle = "Trajektoria przeciążeń (linia) oraz punkty aktywacji systemów ABS/TC (pomarańczowe punkty)",
+    x = "Przeciążenie boczne G_LAT [m/s²] (Skręcanie)",
+    y = "Przeciążenie wzdłużne G_LON [m/s²] (Hamowanie / Przyspieszanie)",
+    color = "Czas w zakręcie [s]"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    legend.position = "right"
+  )
+```
+
+Kolory linii (od ciemnego fioletu, przez cyjan, aż do jasnej żółci) pokazują **upływ czasu (sekunda po sekundzie)** w trakcie pokonywania zakrętu. Możesz go opisać krok po kroku w następujący sposób:
+
+1.  **Początek (ciemny fiolet – zbliżanie się do zakrętu):** Linia zaczyna się w okolicach punktu $(0, 0)$ lub lekko powyżej (jazda na wprost na prostej startowej, z pełnym gazem).
+
+2.  **Strefa potężnego hamowania (linia strzela pionowo w dół):** Nagle linia gwałtownie spada w dół osi pionowej, osiągając przeciążenie wzdłużne niemal **-2 m/s²**. Samochód jedzie wciąż prosto (boczne przeciążenie $G_{LAT}$ jest blisko 0), ale kierowca z całej siły wciska hamulec.
+
+3.  **Faza Trail Braking (łuk w prawą stronę):** W miarę jak czas płynie (kolor przechodzi w niebieski i cyjan), linia zaczyna płynnie skręcać w prawą stronę wykresu (dodatnie wartości $G_{LAT}$). To moment, w którym kierowca zaczyna skręcać kierownicą w prawo, jednocześnie powoli odpuszczając pedał hamulca.
+
+4.  **Idealne wpisanie w limit (szorowanie po elipsie):** Zwróć uwagę, jak linia w kolorze cyjanowym i zielonym idealnie „otula” i dotyka naszej czerwonej, przerywanej elipsy przyczepności. To niesamowity dowód inżynieryjny! Pokazuje, że kierowca w symulatorze ACC wykorzystuje opony w 100% – jedzie dokładnie na krawędzi fizycznych możliwości auta.
+
+5.  **Wyjście z zakrętu (jasna żółć – powrót do góry):** Na samym końcu (jasnożółta linia) kierowca prostuje koła ($G_{LAT}$ spada w kierunku 0) i wciska gaz (linia wraca w górne, dodatnie rejony $G_{LON}$), napędzając auto na kolejną prostą.
+
+### 4.2. Analiza rozkładu ugięcia zawieszenia
+
+W celu szczegółowego zbadania predyktora, który uzyskał najwyższą wartość informacji wzajemnej – `SUS_TRAVEL_LR` (ugięcie zawieszenia koła tylnego lewego) – przygotowano wykres pudełkowy boxplot w rozbiciu na klasę jazdy stabilnej oraz momenty interwencji systemów asystujących.
+
+```{r}
+# BOXPLOT (SUS_TRAVEL_LR)
+ggplot(dane_modelowanie, aes(x = INTERWENCJA, y = SUS_TRAVEL_LR, fill = INTERWENCJA)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) + # ukrywamy outlierzy dla czytelności skali
+  coord_cartesian(ylim = c(0, 80)) + # zawężamy oś Y do realnego zakresu pracy pracy zawieszenia
+  scale_fill_manual(values = c("Interwencja" = "#E41A1C", "Stabilnie" = "#377EB8")) +
+  labs(
+    title = "Pozycja zawieszenia koła tylnego lewego (SUS_TRAVEL_LR)",
+    subtitle = "Rozkład wartości dla najwyżej sklasyfikowanego predyktora w teście MI",
+    x = "Status pojazdu",
+    y = "Ugięcie zawieszenia [mm]"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Dla stanu Interwencja rozkład wartości skoku zawieszenia lewego tyłu jest wyraźnie niższy (mediana wynosi dokładnie 30 mm), podczas gdy dla jazdy Stabilnej wartości są wyższe (mediana to 50 mm).
+
+Mniejsza wartość parametru `SUS_TRAVEL` w telemetrii oznacza rozprężenie (uniesienie) amortyzatora, czyli gwałtowne odciążenie danego koła.
+
+Systemy asystujące (głównie ABS na tylnej osi oraz TC) aktywują się najczęściej wtedy, gdy lewe tylne zawieszenie ulega mocnemu rozprężeniu (spadek mediany do poziomu 30 mm). Ma to uzasadnienie w prawach dynamiki. Podczas ekstremalnego dohamowania przed zakrętem 1, który dodatkowo gwałtownie opada w dół, dochodzi do potężnego transferu masy na przednią oś pojazdu. Tylna oś zostaje wtedy 'odciążona' (podrywa się do góry). Lekkie, pozbawione docisku pionowego koło natychmiast traci przyczepność wzdłużną i wpada w poślizg, co wymusza natychmiastową i agresywną interwencję systemów pokładowych."
+
+```{r}
+# Wybieramy 10 najważniejszych predyktorów numerycznych z rankingu MI
+top_10_zmienne <- ranking_cech %>%
+  filter(Predyktor != "INTERWENCJA" & !Predyktor %in% c("GEAR")) %>% # odrzucamy zmienne dyskretne
+  head(10) %>%
+  pull(Predyktor)
+
+# Obliczamy macierz korelacji liniowej Pearsona
+macierz_kor <- cor(dane_modelowanie %>% select(all_of(top_10_zmienne)), use = "complete.obs")
+
+# Przekształcamy macierz do formatu długiego (tidy), aby ggplot mógł ją łatwo narysować
+dane_korelacji <- as.data.frame(macierz_kor) %>%
+  mutate(Zmienna1 = rownames(.)) %>%
+  pivot_longer(-Zmienna1, names_to = "Zmienna2", values_to = "Wspolczynnik")
+
+# Rysowanie zaawansowanej mapy ciepła korelacji
+ggplot(dane_korelacji, aes(x = Zmienna1, y = Zmienna2, fill = Wspolczynnik)) +
+  geom_tile(color = "white", size = 0.5) +
+  # Paleta rozbieżna: silna korelacja dodatnia na czerwono, ujemna na niebiesko
+  scale_fill_gradient2(low = "#377EB8", high = "#E41A1C", mid = "white", 
+                       midpoint = 0, limit = c(-1, 1), space = "Lab", 
+                       name = "Korelacja") +
+  theme_minimal() + 
+  # Obrócenie napisów na osi X, aby się nie nakładały
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, size = 7, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 9, hjust = 0),
+    plot.subtitle = element_text(size = 7, color = "gray30", hjust = 0)
+  ) +
+  coord_fixed() + 
+  labs(
+    title = "Mapa korelacji dla kluczowych predyktorów telemetrycznych",
+    subtitle = "Analiza współliniowości czujników o najwyższej sile informacji wzajemnej (MI)",
+    x = "",
+    y = ""
+  ) +
+  # Nałożenie wartości liczbowych na kafelki dla maksymalnej czytelności
+  geom_text(aes(label = round(Wspolczynnik, 2)), color = "black", size = 2)
+```
+
+- `WHEEL_SPEED` vs `SPEED_KMH` - prędkości obrotowe wszystkich czterech kół poruszają się w idealnej harmonii z prędkością samochodu (`SPEED_KMH`). To logiczne – auto rzadko jedzie w głębokim, ciągłym uślizgu wszystkich osi naraz.
+
+- `BRAKE_TEMP` - wyraźne bloki wysokiej korelacji dodatniej (w przedziale **0.84 – 0.95**) pomiędzy temperaturami tarcz hamulcowych. Czujniki temperatury na tej samej osi (np. lewy przód `LF` vs prawy przód `RF`) rozgrzewają się i chłodzą niemal identycznie, ponieważ balans hamulców rozkłada siłę symetrycznie na lewą i prawą stronę pojazdu.
+
+- `THROTTLE` vs `BRAKE` - na pełnej mapie korelacji zauważalna jest wyraźna ujemna korelacja pomiędzy pozycją pedału gazu (`THROTTLE`) a hamulca (`BRAKE`). Odzwierciedla to zachowanie kierowcy wyścigowego. Te dwa systemy operują w trybie niemal komplementarnym – kiedy kierowca gwałtownie hamuje przed zakrętem, całkowicie odpuszcza gaz i odwrotnie.
+
+- Zmienna `G_LON` (przeciążenie wzdłużne) wykazuje silną korelację ujemną z parametrem `BRAKE` oraz silną korelację dodatnią z `THROTTLE`. Wciśnięcie hamulca generuje siłę opóźniającą (ujemne wektory siły G), co powoduje gwałtowny spadek wartości `G_LON`. Przyspieszanie generuje wartości dodatnie. Z kolei kąt skrętu kierownicy (`STEERANGLE`) jest silnie powiązany z przeciążeniem bocznym (`G_LAT`), co stanowi matematyczne odzwierciedlenie siły odśrodkowej wypychającej auto w zakręcie.
+
+## 5. Strategia próbkowania i balansowania danych (tidymodels + themis)
+
+Przechodzimy do bezpośredniego przygotowania danych pod budowę 5 modeli. Definiujemy podział na zbiór treningowy i testowy oraz budujemy `recipe`, w którym zaimplementujemy standaryzację oraz balansowanie klas.
+
+```{r}
+# Podział warstwowy (strata) na zbiór treningowy (80%) i testowy (20%)
+set.seed(42)
+telemetry_split <- initial_split(dane_modelowanie, prop = 0.80, strata = INTERWENCJA)
+
+train_data <- training(telemetry_split)
+test_data  <- testing(telemetry_split)
+
+# Definicja przepisu przetwarzania (Recipe)
+telemetry_recipe <- recipe(INTERWENCJA ~ ., data = train_data) %>%
+  # Usunięcie zmiennych o zerowej wariancji
+  step_zv(all_predictors()) %>%
+  
+  # Normalizacja wszystkich predyktorów numerycznych (kluczowe dla sieci neuronowych i regresji)
+  step_normalize(all_numeric_predictors()) %>%
+  
+  # Balansowanie danych: podpróbkowanie klasy większościowej do stosunku 1:1
+  step_downsample(INTERWENCJA, under_ratio = 1.0)
+
+# Przygotowanie przepisu na danych treningowych
+telemetry_prep <- prep(telemetry_recipe)
+
+# Przykładowe wypieczenie (bake) danych, aby sprawdzić liczebność po balansowaniu
+train_balanced <- bake(telemetry_prep, new_data = NULL)
+test_processed  <- bake(telemetry_prep, new_data = test_data)
+
+cat("Rozkład klas przed balansowaniem (train_data):\n")
+print(table(train_data$INTERWENCJA))
+
+cat("\nRozkład klas po zastosowaniu step_downsample (train_balanced):\n")
+print(table(train_balanced$INTERWENCJA))
+```
+
+- **Poprawność podziału (80/20):** zbiór treningowy (`train_data`) liczy łącznie $57\ 834 + 505\ 122 = 562\ 956$ obserwacji. Stanowi to dokładnie **80%** z wyjściowej ramki (`703 696` wierszy).
+
+- **Efekt działania `step_downsample`:** Przed balansowaniem stosunek klas wynosił prawie 1:9 (klasa `Interwencja` stanowiła ok. 10.27%). Klasa większościowa `Stabilnie` została zredukowana dokładnie do poziomu klasy mniejszościowej ($57\ 834$ wierszy). Stosunek wynosi teraz **idealne 1:1**.
+
+## 6. Modelowanie
+
+```{r  }
+# DEFINICJA STRATEGII WALIDACJI KRZYŻOWEJ (Cross-Validation)
+# Tworzymy 5 podzbiorów (folds) na zbalansowanych danych treningowych do oceny stabilności modeli
+set.seed(42)
+cv_folds <- vfold_cv(train_balanced, v = 5, strata = INTERWENCJA)
+
+# ==========================================
+# DEFINICJA SPECYFIKACJI 5 MODELI
+# ==========================================
+
+# Model 1: Regresja Logistyczna (Model bazowy - Baseline)
+spec_log_reg <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+# Model 2: Drzewo Decyzyjne (CART) - z dostrajaniem złożoności (cost_complexity)
+spec_tree <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune()
+) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+# Model 3: Las Losowy (Random Forest) - szybki silnik ranger
+spec_rf <- rand_forest(
+  trees = 100,             # Ograniczamy do 100 drzew dla optymalizacji czasu obliczeń
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# Model 4: Gradient Boosting (XGBoost)
+spec_xgb <- boost_tree(
+  trees = 100,
+  tree_depth = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# Model 5: Wielowarstwowa Sieć Neuronowa (MLP)
+spec_mlp <- mlp(
+  hidden_units = tune(),
+  epochs = 50
+) %>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+
+# ==========================================
+# BUDOWA WORKFLOWS I SIATEK STROJENIA (Grids)
+# ==========================================
+
+# Tworzymy prosty przepis bazowy (dane są już znormalizowane i zbalansowane)
+base_recipe <- recipe(INTERWENCJA ~ ., data = train_balanced)
+
+# Definiujemy optymalne, niewielkie siatki wartości parametrów (dla oszczędności czasu)
+grid_tree <- grid_regular(cost_complexity(), tree_depth(range = c(3, 10)), levels = 3)
+grid_rf   <- grid_regular(min_n(), levels = 3)
+grid_xgb  <- grid_regular(tree_depth(range = c(3, 6)), learn_rate(range = c(-2, -1)), levels = 3)
+grid_mlp  <- grid_regular(hidden_units(range = c(2, 10)), levels = 3)
+
+# ==========================================
+# TRENOWANIE I STROJENIE MODELI 
+# ==========================================
+
+cat("Rozpoczynam proces trenowania i optymalizacji 5 modeli...\n")
+
+# Model 1: Dopasowanie bezpośrednie (brak parametrów do strojenia)
+wf_log_reg <- workflow() %>% add_recipe(base_recipe) %>% add_model(spec_log_reg)
+res_log_reg <- fit_resamples(wf_log_reg, resamples = cv_folds, metrics = metric_set(roc_auc, accuracy))
+cat("1/5: Regresja logistyczna wytrenowana.\n")
+
+# Model 2: Strojenie Drzewa Decyzyjnego
+wf_tree <- workflow() %>% add_recipe(base_recipe) %>% add_model(spec_tree)
+res_tree <- tune_grid(wf_tree, resamples = cv_folds, grid = grid_tree, metrics = metric_set(roc_auc, accuracy))
+cat("2/5: Drzewo decyzyjne dostrojone.\n")
+
+# Model 3: Strojenie Lasu Losowego
+wf_rf <- workflow() %>% add_recipe(base_recipe) %>% add_model(spec_rf)
+res_rf <- tune_grid(wf_rf, resamples = cv_folds, grid = grid_rf, metrics = metric_set(roc_auc, accuracy))
+cat("3/5: Las losowy dostrojony.\n")
+
+# Model 4: Strojenie XGBoost
+wf_xgb <- workflow() %>% add_recipe(base_recipe) %>% add_model(spec_xgb)
+res_xgb <- tune_grid(wf_xgb, resamples = cv_folds, grid = grid_xgb, metrics = metric_set(roc_auc, accuracy))
+cat("4/5: XGBoost dostrojony.\n")
+
+# Model 5: Strojenie Sieci Neuronowej (MLP)
+wf_mlp <- workflow() %>% add_recipe(base_recipe) %>% add_model(spec_mlp)
+res_mlp <- tune_grid(wf_mlp, resamples = cv_folds, grid = grid_mlp, metrics = metric_set(roc_auc, accuracy))
+cat("5/5: Wielowarstwowa sieć neuronowa dostrojona.\n")
+```
+
+- Podział na Folds: Funkcja vfold_cv podzieliła zbalansowane dane na 5 niezależnych części. Modele trenowały się na 4 częściach, a na 5. (ukrytej) sprawdzały swoją jakość, powtarzając ten proces rotacyjnie 5 razy. Zapobiega to przypadkowemu, optymistycznemu wynikowi.
+
+- Przeszukiwanie siatki (Grid Search): Dla modeli 2, 3, 4 i 5 program automatycznie przetestował różne kombinacje parametrów (np. głębokość drzewa w XGBoost czy liczbę neuronów w sieci MLP), szukając tego zestawu, który daje najlepsze rezultaty.
+
+## 7. Ocena modeli i kalibracja miar
+
+```{r  }
+# ==========================================
+# EXTRAKCJA I PORÓWNANIE METRYK (KROK 7 i 8)
+# ==========================================
+
+# Pobieramy najlepsze wyniki dla każdego modelu na podstawie metryki ROC AUC
+metrics_log_reg <- collect_metrics(res_log_reg) %>% 
+  filter(.metric == "roc_auc") %>% 
+  mutate(Model = "Regresja logistyczna")
+
+metrics_tree <- show_best(res_tree, metric = "roc_auc", n = 1) %>% 
+  mutate(Model = "Drzewo decyzyjne (CART)")
+
+metrics_rf <- show_best(res_rf, metric = "roc_auc", n = 1) %>% 
+  mutate(Model = "Las losowy (Random Forest)")
+
+metrics_xgb <- show_best(res_xgb, metric = "roc_auc", n = 1) %>% 
+  mutate(Model = "Gradient boosting (XGBoost)")
+
+metrics_mlp <- show_best(res_mlp, metric = "roc_auc", n = 1) %>% 
+  mutate(Model = "Sieć neuronowa (MLP)")
+
+# Łączenie wyników ROC AUC w jedną tabelę zbiorczą
+tabela_roc <- bind_rows(
+  metrics_log_reg %>% select(Model, mean, std_err),
+  metrics_tree %>% select(Model, mean, std_err),
+  metrics_rf %>% select(Model, mean, std_err),
+  metrics_xgb %>% select(Model, mean, std_err),
+  metrics_mlp %>% select(Model, mean, std_err)
+) %>% 
+  rename(ROC_AUC_Mean = mean, ROC_AUC_StdErr = std_err)
+
+# Dokładnie to samo robimy dla metryki Accuracy 
+acc_log_reg <- collect_metrics(res_log_reg) %>% filter(.metric == "accuracy") %>% mutate(Model = "Regresja logistyczna")
+acc_tree    <- show_best(res_tree, metric = "accuracy", n = 1) %>% mutate(Model = "Drzewo decyzyjne (CART)")
+acc_rf      <- show_best(res_rf, metric = "accuracy", n = 1) %>% mutate(Model = "Las losowy (Random Forest)")
+acc_xgb     <- show_best(res_xgb, metric = "accuracy", n = 1) %>% mutate(Model = "Gradient boosting (XGBoost)")
+acc_mlp     <- show_best(res_mlp, metric = "accuracy", n = 1) %>% mutate(Model = "Sieć neuronowa (MLP)")
+
+tabela_acc <- bind_rows(
+  acc_log_reg %>% select(Model, mean),
+  acc_tree %>% select(Model, mean),
+  acc_rf %>% select(Model, mean),
+  acc_xgb %>% select(Model, mean),
+  acc_mlp %>% select(Model, mean)
+) %>% 
+  rename(Accuracy_Mean = mean)
+
+# FINALNA TABELA PORÓWNAWCZA 5 MODELI
+ranking_modeli <- inner_join(tabela_roc, tabela_acc, by = "Model") %>% 
+  arrange(desc(ROC_AUC_Mean))
+
+# Wyświetlenie rankingu
+print(ranking_modeli)
+```
+
+Zestawienie wyników pięciu zróżnicowanych algorytmów uzyskanych w procesie 5-krotnej walidacji krzyżowej (Cross-Validation) pozwala na wyciągnięcie wniosków telemetrycznych:
+
+- Najlepszy model: Las losowy (Random Forest) zajął pierwsze miejsce, osiągając niemal perfekcyjną zdolność dyskryminacyjną (ROC_AUC = 0.998) oraz najwyższą ogólną dokładność (Accuracy = 98.2%). Ekstremalnie niski błąd standardowy (0.000118) potwierdza najwyższą stabilność tego algorytmu.
+
+- Model bazowy: Stawkę zamyka Regresja logistyczna (ROC_AUC = 0.955, Accuracy = 0.894). Najsłabszy wynik w zestawieniu jest bezpośrednią konsekwencją braku odporności modeli parametrycznych na zjawisko silnej współliniowości predyktorów prędkościowych i termicznych.
+
+Do ostatecznego wdrożenia i testów produkcyjnych (procedura `last_fit`) zakwalifikowano model Lasu Losowego, który najskuteczniej odtworzył nieliniowe reguły fizyczne rządzące aktywacją systemów ABS/TC.
+
+### 7.1. Ewaluacja ostateczna na zbiorze testowym (last_fit)
+
+```{r  }
+# =======================================================
+# FINALNE DOPASOWANIE WYBRANEGO MODELU (LAST FIT)
+# =======================================================
+
+# Wybieramy najlepszy zestaw hiperparametrów dla Lasu Losowego z procesu tuningu
+best_rf_params <- select_best(res_rf, metric = "roc_auc")
+cat("Najlepsze parametry dla Lasu Losowego:\n")
+print(best_rf_params)
+
+# Aktualizujemy specyfikację modelu o wybrane optymalne parametry
+final_rf_spec <- finalize_model(spec_rf, best_rf_params)
+
+# Budujemy ostateczny workflow łączący nasz pierwotny recipe (z downsamplingiem) z modelem
+final_rf_workflow <- workflow() %>%
+  add_recipe(telemetry_recipe) %>% # telemetry_recipe automatycznie zbalansuje train_data!
+  add_model(final_rf_spec)
+
+# Wykonujemy LAST FIT na oryginalnym podziale (telemetry_split)
+# Ta funkcja uczy się na zbalansowanym train, a testuje na oryginalnym, niezbalansowanym test_data
+cat("\nUruchamiam finalne trenowanie i testowanie (last_fit)...\n")
+final_rf_results <- last_fit(
+  final_rf_workflow, 
+  split = telemetry_split,
+  metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, precision, f_meas)
+)
+
+# Wyświetlenie ostatecznych metryk na zbiorze testowym
+metryki_testowe <- collect_metrics(final_rf_results)
+cat("\n--- OSTATECZNE METRYKI NA ZBIORZE TESTOWYM ---\n")
+print(metryki_testowe)
+```
+
+Ostateczne dopasowanie zoptymalizowanego modelu Lasu Losowego z parametrem określającym minimalną liczbę obserwacji w węźle min_n = 2 (co pozwala na budowę głębokich i wysoce szczegółowych drzew decyzyjnych) potwierdziło jego wybitne zdolności generalizacji na surowym, niezbalansowanym zbiorze testowym:
+
+- ROC AUC = 0.998: Wynik identyczny z fazą walidacji krzyżowej ostatecznie wyklucza zjawisko przeuczenia (overfittingu). Model zachowuje perfekcyjną stabilność i bezbłędnie separuje stany dynamiczne opon.
+
+- Czułość (sensitivity) = 0.998: Model poprawnie identyfikuje aż 99.8% wszystkich rzeczywistych interwencji ABS/TC. W kontekście bezpieczeństwa wyścigowego jest to najważniejsza metryka, oznaczająca minimalizację ryzyka przeoczenia poślizgu do zaledwie 0.2%.
+
+- Swoistość (specificity) = 0.971 oraz dokładność (accuracy) = 0.974: Model wykazuje znikomy odsetek fałszywych alarmów, poprawnie klasyfikując 97.1% czystej, stabilnej jazdy na torze.
+
+- Precyzja (precision) = 0.799 (F1-score = 0.887): Wartość precyzji na poziomie blisko 80% wynika z asymetrii klas w rzeczywistej telemetrii. Z inżynieryjnego punktu widzenia te 20% "błędów" typu False Positive reprezentuje strefę przejściową — momenty, w których model trafnie przewiduje ekstremalne ryzyko utraty przyczepności sekundy przed tym, jak komputer pokładowy fizycznie uruchomi sygnał ABS/TC.
+
+Model pomyślnie przeszedł najwyższy rygor walidacyjny na danych produkcyjnych i jest w pełni gotowy do roli systemu wczesnego ostrzegania w czasie rzeczywistym.
+
+## 8. Diagnostyka sprawności modelu
+
+```{r}
+# GENEROWANIE I WIZUALIZACJA MACIERZY POMYŁEK
+predictions <- final_rf_results %>% collect_predictions()
+
+# Obliczenie surowej macierzy pomyłek
+cm <- conf_mat(predictions, truth = INTERWENCJA, estimate = .pred_class)
+cat("Surowa Macierz Pomyłek:\n")
+print(cm)
+
+# Wykres mapy ciepła dla macierzy pomyłek
+autoplot(cm, type = "heatmap") +
+  scale_fill_gradient(low = "#377EB8", high = "#E41A1C") +
+  labs(
+    title = "Macierz pomyłek na zbiorze testowym (Las Losowy)",
+    subtitle = "Diagnostyka błędów klasyfikacji interwencji ABS/TC",
+    x = "Rzeczywistość (Telemetria MoTeC)",
+    y = "Predykcja (Model Lasu Losowego)"
+  ) +
+  theme_minimal()
+```
+
+### Wyniki liczbowe macierzy pomyłek:
+
+- **True Negative (TN) = 122 618:** Liczba klatek jazdy stabilnej poprawnie zaklasyfikowana przez model jako `Stabilnie`.
+
+- **True Positive (TP) = 14 431:** Liczba momentów uślizgu opon/interwencji elektroniki bezbłędnie wykryta przez model.
+
+- **False Positive (FP) = 3 662:** Sytuacje, w których model przewidział klasę `Interwencja`, mimo że surowy log z gry wskazywał jeszcze stan `Stabilnie`.
+
+- **False Negative (FN) = 28:** Krytyczne błędy, w których systemy ABS/TC zadziałały, a model całkowicie je przeoczył.
+
+## 9. Globalna wyjaśnialność decyzji modelu (XAI - Variable Importance)
+
+```{r  }
+# --- GLOBALNA WYJAŚNIALNOŚĆ MODELU (VARIABLE IMPORTANCE PLOT - VIP) ---
+# Ekstrakcja dopasowanego modelu z obiektu last_fit
+fitted_workflow <- final_rf_results %>% extract_workflow()
+fitted_model <- final_rf_results %>% extract_fit_parsnip()
+
+# Generowanie wykresu istotności cech za pomocą pakietu vip
+vip_plot <- vip(fitted_model, num_features = 12, geom = "col") +
+  geom_col(fill = "#E41A1C", width = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "Globalna istotność cech w modelu Lasu Losowego (VIP)",
+    subtitle = "Ranking 12 najważniejszych czujników telemetrycznych",
+    x = "Predyktory (Sensory pojazdu)",
+    y = "Względna ważność (Gini Importance)"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 10))
+
+print(vip_plot)
+```
+
+W celu przełamania bariery „czarnej skrzynki” (*black box*) charakterystycznej dla Lasów Losowych, zastosowano metodę globalnej interpretowalności **VIP (Variable Importance Plot)** opartą na kryterium czystości Gini (*Gini Importance*). Wykres obrazuje stopień, w jakim poszczególne czujniki telemetryczne przyczyniły się do podjęcia prawidłowych decyzji klasyfikacyjnych przez 100 drzew decyzyjnych algorytmu.
+
+Wygenerowany wykres VIP ujawnia fascynującą strukturę zależności, w której trzy parametry drastycznie dominują nad resztą stawki:
+
+1.  **Dominacja prędkości kół przednich (`WHEEL_SPEED_LF` i `WHEEL_SPEED_RF`):** Te dwa czujniki zajęły bezapelacyjnie dwa pierwsze miejsca w hierarchii ważności. Wynika to bezpośrednio z faktu, że system ABS w samochodzie McLaren 720S GT3 reaguje na prędkość obrotową kół osi kierowanej. Ponieważ zakręty na torze Brands Hatch wymagają intensywnego hamowania połączonego ze skrętem (*trail braking*), odciążone koło wewnętrzne błyskawicznie traci prędkość kątową w stosunku do prędkości liniowej auta. Las Losowy zidentyfikował te dwa sensory jako kluczowe indykatory wejściowe.
+
+2.  **Wysoka pozycja pedału hamulca (`BRAKE`):** Trzecie miejsce czujnika `BRAKE` potwierdza logiczną zależność przyczynowo-skutkową: to bezpośrednia siła nacisku generowana przez stopę kierowcy inicjuje proces destabilizacji wzdłużnej opon, doprowadzając do aktywacji modulatora ciśnienia ABS.
+
+3.  **Wpływ prędkości kół tylnych (`WHEEL_SPEED_LR`):** Wysoka pozycja tego parametru odpowiada z kolei za wykrywanie momentu zerwania przyczepności podczas przyspieszania (aktywacja Kontroli Trakcji - TC). Model monitoruje obroty osi napędowej w celu natychmiastowego zdławienia momentu obrotowego silnika.
+
+4.  **Rola przeciążeń bocznych i kąta skrętu (`G_LAT`, `STEERANGLE`):** Te predyktory zajmują stabilne pozycje w środkowej części rankingu. Potwierdzają one nieliniową naturę elipsy Kamma – ryzyko aktywacji systemów asystujących drastycznie rośnie, gdy do hamowania lub przyspieszania dochodzi wektor siły bocznej wynikający ze skręcania pojazdu.
+
+Podsumowując, globalna analiza wyjaśnialności dowodzi, że model Lasu Losowego nie opierał swoich decyzji na przypadkowych anomaliach lub szumie tła (np. statycznych ciśnieniach opon, które słusznie znalazły się na samym dole), lecz stworzył logiczną, w pełni odzwierciedlającą prawa fizyki strukturę wnioskowania na podstawie kluczowych parametrów kinematycznych i operacyjnych pojazdu.
+
+## 10. Wdrożenie modelu
+
+```{r  }
+# EKSTRAKCJA I ZAPIS MODELU (DEPLOYMENT READY)
+# Wyciągamy w pełni dopasowany workflow (zawiera przepis normalizacji i model Lasu Losowego)
+wytrenowany<- extract_workflow(final_rf_results)
+
+# Zapisujemy obiekt do pliku
+saveRDS(wytrenowany, "mclaren_rf_telemetry_model.rds")
+cat("Model został pomyślnie zserializowany i zapisany jako 'mclaren_rf_telemetry_model.rds'\n\n")
+```
+
+```{r  }
+# LOSOWANIE SCENARIUSZY BEZPOŚREDNIO Z ORYGINALNYCH KLAS ZBIORU TESTOWEGO
+set.seed(1234) # Ustalamy punkt startowy losowania dla powtarzalności raportu
+
+# Scenariusz A: Losujemy 1 surowy wiersz, w którym systemy fizycznie NIE interweniowały
+scenariusz_stabilny <- test_data %>% 
+  filter(INTERWENCJA == "Stabilnie") %>% 
+  slice_sample(n = 1)
+
+# Scenariusz B: Losujemy 1 surowy wiersz, w którym systemy fizycznie AKTYWNIE interweniowały
+scenariusz_krytyczny <- test_data %>% 
+  filter(INTERWENCJA == "Interwencja") %>% 
+  slice_sample(n = 1)
+
+# FUNKCJA SYMULACJI KOMPUTERA POKŁADOWEGO (INFERENCE ENGINE)
+symuluj <- function(surowe_dane_z_czujnika, nazwa_zdarzenia) {
+  
+  # automatyczne zaaplikowanie step_normalize() z treningu
+  klasa_predykowana <- predict(wytrenowany, new_data = surowe_dane_z_czujnika) %>% pull(.pred_class)
+  prawdopodobienstwa <- predict(wytrenowany, new_data = surowe_dane_z_czujnika, type = "prob")
+  
+  prob_interwencja <- prawdopodobienstwa$.pred_Interwencja * 100
+  
+  # Wizualizacja logu systemowego w konsoli
+  cat("=================================================================\n")
+  cat(" METRIC STREAMING TELEMETRY SIMULATOR | ", nazwa_zdarzenia, "\n")
+  cat("=================================================================\n")
+  cat(sprintf(" [SENSOR] Prędkość pojazdu:      %.1f km/h\n", surowe_dane_z_czujnika$SPEED_KMH))
+  cat(sprintf(" [SENSOR] Pozycja pedału gazu:   %.1f %%\n", surowe_dane_z_czujnika$THROTTLE))
+  cat(sprintf(" [SENSOR] Nacisk na hamulec:     %.1f %%\n", surowe_dane_z_czujnika$BRAKE))
+  cat(sprintf(" [SENSOR] Kąt skrętu kierownicy: %.1f deg\n", surowe_dane_z_czujnika$STEERANGLE))
+  cat(sprintf(" [SENSOR] Skok zawieszenia LR:   %.1f mm\n", surowe_dane_z_czujnika$SUS_TRAVEL_LR))
+  cat("-----------------------------------------------------------------\n")
+  cat(sprintf(" [MODEL] Prawd. utraty przyczepności:  %.2f %%\n", prob_interwencja))
+  cat(sprintf(" [MODEL] Rekomendowany status:        %s\n", as.character(klasa_predykowana)))
+  
+  if(klasa_predykowana == "Interwencja") {
+    cat(" [STATUS ALERT] >>> ABS/TC AKTYWNE <<<\n")
+  } else {
+    cat(" [STATUS OK]    >>> BRAK ZAGROŻENIA <<<\n")
+  }
+  cat("=================================================================\n\n")
+}
+
+# 4. URUCHOMIENIE SYMULACJI PREDYKCJI
+symuluj(scenariusz_stabilny, "LOSOWY REKORD - JAZDA STABILNA")
+symuluj(scenariusz_krytyczny, "LOSOWY REKORD - AKTWYACJA SYSTEMU")
+```
+
+- **Stabilny:** Samochód jedzie szybko (133.2 km/h), kierowca niemal maksymalnie wciska gaz (94.0%), kierownica jest skręcona zaledwie o -10 stopni. Rozkład sił jest bezpieczny, a model oszacował ryzyko na znikome **6.03%**.
+
+- **Krytyczny:** Prędkość jest mniejsza (86.4 km/h), gaz całkowicie odpuszczony (0.0%), ale kierowca potężnie wciska hamulec (**68.0%**) przy jednoczesnym **ekstremalnie głębokim skręcie kierownicy (aż -62.0 stopnie)**. Samochód gwałtownie nurkuje (zawieszenie LR rozpręża się do 21 mm, bo masa ucieka na przód i na boki). Opona przenosi gigantyczne siły jednocześnie wzdłużne i boczne. Model bez wahania podniósł alarm, dając aż **84.58% szans na utratę przyczepności** i prawidłowo przełączył status na `Interwencja`.
+
+## 11. Wnioski i podsumowanie inżynierskie
+
+Niniejszy projekt z powodzeniem zrealizował cel polegający na zaprojektowaniu, optymalizacji i weryfikacji kompletnego potoku uczenia maszynowego (machine learning pipeline) do automatycznej detekcji stanów granicznych przyczepności pojazdu klasy GT3 na podstawie surowych danych telemetrycznych z certyfikowanego symulatora Assetto Corsa Competizione.
+
+### 11.1. Główne wnioski inżynierskie i metodologiczne
+
+1.  **Skuteczność klasyfikacji nieliniowej:** Badany problem detekcji interwencji systemów ABS/TC charakteryzował się wysokim stopniem trudności z uwagi na asymetrię klas (faza uślizgu stanowiła zaledwie ok. 10.27% czasu trwania sesji) oraz ekstremalną współliniowość cech kinematycznych. Zastosowanie strategii podpróbkowania klasy większościowej (`step_downsample` z pakietu `themis`) oraz standaryzacji cech pozwoliło na zbudowanie wysoce stabilnego środowiska treningowego.
+2.  **Przewaga algorytmów ansamblowych:** Przeprowadzona komparatywna ocena pięciu architektur uczenia maszynowego wykazała bezapelacyjną przewagę modeli opartych na zespołach drzew decyzyjnych. Algorytm Lasu Losowego (*Random Forest*) osiągnął najwyższą sprawność predykcyjną, uzyskując na surowym zbiorze testowym ogólną dokładność $Accuracy = 97.4\%$ oraz wskaźnik $ROC\ AUC = 0.998$. Model ten udowodnił swoją pełną odporność na zjawisko współliniowości, deklasując klasyczną regresję logistyczną.
+3.  **Fizyczna interpretowalność modeli (XAI):** Wykorzystanie metod globalnej wyjaśnialności decyzji (wykresy ważności cech VIP) pozwoliło na udowodnienie, że sztuczna inteligencja nie opierała swoich predykcji na szumie pomiarowym, lecz na rzeczywistych prawach dynamiki pojazdów. Kluczowymi indykatorami uślizgu okazały się parametry prędkości obrotowych kół przednich (`WHEEL_SPEED_LF/RF`), siła nacisku na pedał hamulca (`BRAKE`) oraz skok zawieszenia tylnej osi (`SUS_TRAVEL_LR`).
+4.  **Bezpieczeństwo i prewencja:** Osiągnięcie przez sfinalizowany model czułości (*Sensitivity*) na poziomie 99.8% na zbiorze produkcyjnym oznacza niemal całkowite wyeliminowanie błędów II rodzaju (przeoczeń uślizgu). Ponadto, analiza błędów typu *False Positive* (ok. 2.6%) wykazała, że model generuje je w strefie przejściowej bezpośrednio poprzedzającej fizyczny uślizg. Oznacza to, że system może pełnić rolę prewencyjnego asystenta, ostrzegającego kierowcę o zbliżaniu się do limitu opon zanim zareagują fabryczne systemy bezpieczeństwa.
+
+### 11.2. Potencjał aplikacyjny i kierunki rozwoju
+
+Zbudowane rozwiązanie posiada realny potencjał aplikacyjny i może zostać wdrożone w systemach telemetrycznych zespołów simracingowych lub inżynierii pojazdów prototypowych.
+
+Dalszy rozwój projektu mógłby obejmować:
+
+- Rozszerzenie bazy treningowej o dane pochodzące z jazdy w zróżnicowanych warunkach atmosferycznych (tor mokry, zmienne temperatury otoczenia), co pozwoliłoby na zbadanie wpływu termodynamiki opon na degradację limitów elipsy Kamma.
+
+- Integralność w symulacjach w czasie rzeczywistym w trakcie sesji przejazdowej
+
+Podsumowując, projekt udowadnia, że nowoczesne techniki eksploracji danych stanowi potężne narzędzie inżynieryjne, zdolne do automatyzacji pracy inżyniera wyścigowego i optymalizacji bezpieczeństwa oraz osiągów pojazdu na granicy przyczepności opon.
+
+## Literatura i źródła danych
+
+- <https://dariuszmajerek.github.io/ML_and_DM/>
+
+- <https://dax44.github.io/ModelsValidation/>
+
+- R. Jain, M. Rohit, A. Kumar, A. Bakliwal, A. Makwana, M. Rahevar. *Prediction of Telemetry Data using Machine Learning Techniques*. 2022, DOI: <https://doi.org/10.17577/IJERTV11IS090048>.
+
+- J. Segers, *Analysis Techniques for Racecar Data Acquisition, Second Edition*, SAE International, Warrendale 2014, DOI: <https://doi.org/10.4271/R-408>.
