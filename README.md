@@ -2,6 +2,8 @@
 
 An end-to-end Data Engineering and Machine Learning project focused on predicting vehicle traction limits (ABS/TC interventions) based on high-frequency telemetry data (200 Hz) extracted from the **Assetto Corsa Competizione** simulator at the **Brands Hatch** circuit.
 
+[🚀 HTML Report](https://carolynee01.github.io/mclaren-gt3-telemetry-ml/telemetry_analysis_report.html)
+
 ---
 
 ## 🚀 Project Overview
